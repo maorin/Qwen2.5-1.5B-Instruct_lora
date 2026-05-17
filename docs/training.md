@@ -126,7 +126,8 @@ LoraConfig(
 | `dropout=0.05` | 轻微 | 防止 800–1200 这种小数据集过拟合 |
 | `bias="none"` | 不学 bias | 节省参数，无明显收益丢失 |
 
-可训练参数约占 base model 1.5%（~20M / ~1.5B），最终 adapter ckpt ~30MB。
+可训练参数约占 base model 1.5%（~20M / ~1.5B），最终 adapter 权重 **~70MB**（bf16/fp16
+存储），相比 base model 的 2.9GB 压缩到约 2.4%。
 
 ---
 
@@ -190,17 +191,32 @@ python train/train_lora.py \
 #   --no_demo         跳过 fine-tune 前后对比生成 (节省 1 分钟)
 ```
 
-跑完产物：
+跑完产物（**527MB**，但推理部署只需要 **81MB**）：
 
 ```
 checkpoints/qwen-cloud-lora-v2/
-├── adapter_config.json          # LoRA 配置
-├── adapter_model.safetensors    # LoRA 权重 (~30MB)
-├── tokenizer.json
-├── tokenizer_config.json
-├── special_tokens_map.json
-└── README.md                    # PEFT 自动生成
+├── adapter_config.json          # LoRA 配置 (1KB)
+├── adapter_model.safetensors    # LoRA 权重 (70MB)            ← 推理只要这个
+├── chat_template.jinja          # Qwen 模板拷贝 (2KB)         ← 和这个
+├── tokenizer.json               # 分词器 (11MB)               ← 和这些
+├── tokenizer_config.json        # (1KB)
+├── training_args.bin            # 训练参数快照 (6KB)
+├── README.md                    # PEFT 自动生成
+├── checkpoint-150/              # 第 2 epoch 末完整训练状态 (223MB)  ← 仅 resume 训练用
+└── checkpoint-225/              # 第 3 epoch 末完整训练状态 (223MB)  ← 仅 resume 训练用
 ```
+
+`checkpoint-N` 目录里除了 LoRA 权重，还存了 AdamW optimizer state (一阶+二阶矩，
+比权重还大)、RNG state、lr scheduler 进度，用于"中断后接着训"。**训练完成后可以
+安全删掉**：
+
+```bash
+# 训完只保留可推理产物, 每个 ckpt 目录省 ~446MB
+rm -rf checkpoints/qwen-cloud-lora-v2/checkpoint-*
+```
+
+如果想让 train_lora.py 默认只留 1 个中间 ckpt（而不是 2 个），把 `SFTConfig` 里的
+`save_total_limit=2` 改成 1。
 
 加载方式（已在 `infer/agent_loop.py` 中实现）：
 
