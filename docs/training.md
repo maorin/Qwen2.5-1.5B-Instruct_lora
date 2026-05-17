@@ -215,8 +215,8 @@ checkpoints/qwen-cloud-lora-v2/
 rm -rf checkpoints/qwen-cloud-lora-v2/checkpoint-*
 ```
 
-如果想让 train_lora.py 默认只留 1 个中间 ckpt（而不是 2 个），把 `SFTConfig` 里的
-`save_total_limit=2` 改成 1。
+`train_lora.py` 默认 `save_total_limit=1`，所以训练过程中只会保留**最新一个**
+中间 ckpt 目录，而不是 2 个 —— 这样磁盘占用减半，且仍能从最近一次保存点 resume。
 
 加载方式（已在 `infer/agent_loop.py` 中实现）：
 

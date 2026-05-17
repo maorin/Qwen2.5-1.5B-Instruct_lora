@@ -148,7 +148,7 @@ def main() -> None:
         warmup_ratio=0.03,
         logging_steps=10,
         save_strategy="epoch",
-        save_total_limit=2,
+        save_total_limit=1,
         bf16=(dtype == torch.bfloat16),
         fp16=(dtype == torch.float16),
         max_length=args.max_len,
