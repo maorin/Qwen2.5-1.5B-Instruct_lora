@@ -1,11 +1,11 @@
 """LoRA SFT on Qwen2.5-1.5B-Instruct for cloud function calling.
 
-Key points:
-- 用 tokenizer.apply_chat_template(messages, tools=tools) 渲染样本 → 完美
-  契合 Qwen 原生 tool-calling 格式；
-- 用 trl.DataCollatorForCompletionOnlyLM 让 loss 只覆盖 assistant 段；
-- 自动选 cuda / mps / cpu 设备与对应 dtype；
-- 训练前后各跑一条样例，肉眼对比 fine-tune 效果。
+适配 TRL 1.x / transformers 5.x:
+- 不用已删除的 DataCollatorForCompletionOnlyLM, 自己预 tokenize, 手工把 prompt
+  段 labels 置 -100 (loss 只覆盖最后一条 assistant 消息);
+- SFTTrainer 直接收 peft_config, 不再需要先 get_peft_model 包一层;
+- 用 DataCollatorForSeq2Seq 处理变长 padding (含 labels 用 -100 pad);
+- 自动选 cuda / mps / cpu 设备与对应 dtype。
 """
 from __future__ import annotations
 
@@ -15,18 +15,13 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainingArguments,
+    DataCollatorForSeq2Seq,
 )
-from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
-
-
-# Qwen2.5 chat template 中标识 assistant 段开始的固定 token 序列。
-# DataCollatorForCompletionOnlyLM 用它来定位 loss 起点。
-ASSISTANT_RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
+from trl import SFTConfig, SFTTrainer
 
 
 def pick_device() -> tuple[str, torch.dtype]:
@@ -47,18 +42,38 @@ def load_dataset(path: Path) -> Dataset:
     return Dataset.from_list(rows)
 
 
-def make_formatter(tokenizer):
-    """Return a function: example → rendered text."""
+def build_tokenize_fn(tokenizer, max_length: int):
+    """返回一个把 {messages, tools} 编码成 {input_ids, attention_mask, labels}
+    的函数；prompt 段（除了最后一条 assistant 消息以外的全部内容）labels = -100,
+    模型只在最后一条 assistant 回复上算 loss。"""
 
-    def fmt(example):
-        return tokenizer.apply_chat_template(
-            example["messages"],
-            tools=example.get("tools"),
-            tokenize=False,
-            add_generation_prompt=False,
+    def fn(example):
+        msgs = example["messages"]
+        tools = example.get("tools")
+
+        full_text = tokenizer.apply_chat_template(
+            msgs, tools=tools, tokenize=False, add_generation_prompt=False,
+        )
+        prompt_text = tokenizer.apply_chat_template(
+            msgs[:-1], tools=tools, tokenize=False, add_generation_prompt=True,
         )
 
-    return fmt
+        full_ids = tokenizer(full_text, truncation=True, max_length=max_length,
+                             add_special_tokens=False).input_ids
+        prompt_ids = tokenizer(prompt_text, truncation=True, max_length=max_length,
+                               add_special_tokens=False).input_ids
+
+        # 安全裁剪: prompt_ids 不应超过 full_ids
+        prompt_len = min(len(prompt_ids), len(full_ids))
+        labels = [-100] * prompt_len + full_ids[prompt_len:]
+
+        return {
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
+            "labels": labels,
+        }
+
+    return fn
 
 
 def quick_demo(tokenizer, model, tools, device: str) -> None:
@@ -114,17 +129,13 @@ def main() -> None:
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
     )
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
 
     raw = load_dataset(Path(args.data))
-    fmt = make_formatter(tokenizer)
-
-    # SFTTrainer 接受一个 formatting_func 返回字符串，由它内部 tokenize。
-    # 配合 DataCollatorForCompletionOnlyLM 实现 prompt 段 loss masking。
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=ASSISTANT_RESPONSE_TEMPLATE,
-        tokenizer=tokenizer,
+    tokenize_fn = build_tokenize_fn(tokenizer, args.max_len)
+    tokenized = raw.map(
+        tokenize_fn,
+        remove_columns=raw.column_names,
+        desc="tokenize+mask",
     )
 
     sft_cfg = SFTConfig(
@@ -140,32 +151,39 @@ def main() -> None:
         save_total_limit=2,
         bf16=(dtype == torch.bfloat16),
         fp16=(dtype == torch.float16),
-        max_seq_length=args.max_len,
+        max_length=args.max_len,
         packing=False,
         report_to="none",
         gradient_checkpointing=True,
+        # 我们已经自己做了 mask, 不让 SFTTrainer 再去渲染模板
+        dataset_kwargs={"skip_prepare_dataset": True},
+        remove_unused_columns=False,
     )
 
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_cfg,
-        train_dataset=raw,
-        formatting_func=fmt,
-        data_collator=collator,
-        tokenizer=tokenizer,
+    collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer, padding=True, return_tensors="pt",
     )
 
     if not args.no_demo:
         print("\n=== before fine-tune ===")
-        quick_demo(tokenizer, model, raw[0]["tools"], device)
+        # 用一条样本里的 tools 字段做 demo
+        quick_demo(tokenizer, model, raw[0].get("tools"), device)
 
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_cfg,
+        train_dataset=tokenized,
+        processing_class=tokenizer,
+        data_collator=collator,
+        peft_config=lora_cfg,
+    )
     trainer.train()
     trainer.save_model(args.out_dir)
     tokenizer.save_pretrained(args.out_dir)
 
     if not args.no_demo:
         print("\n=== after fine-tune ===")
-        quick_demo(tokenizer, model, raw[0]["tools"], device)
+        quick_demo(tokenizer, trainer.model, raw[0].get("tools"), device)
 
     print(f"\nLoRA adapter saved → {args.out_dir}")
 
