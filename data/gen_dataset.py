@@ -204,6 +204,94 @@ def sample_two_turn_list_then_summary() -> dict:
     }
 
 
+# ---- multi-call samples (one user request → multiple tool_calls) ----------
+# 这类样本教模型: 不同名字的多个资源 → 发多次 tool_call, 而不是塞 count=N。
+# Qwen2.5 模板支持一条 assistant 消息里携带多个 tool_calls。
+def sample_multi_create_vm() -> dict:
+    n = random.randint(2, 3)
+    region = random.choice(REGIONS)
+    image = random.choice(IMAGES)
+    name_roots = random.sample(["web", "db", "api", "cache", "job", "worker"], n)
+    names = [f"{r}-{random.randint(1, 9)}" for r in name_roots]
+    same_flavor = random.random() < 0.6
+    flavors = ([random.choice(FLAVORS)] * n if same_flavor
+               else [random.choice(FLAVORS) for _ in range(n)])
+
+    if same_flavor:
+        templates = [
+            f"在 {region} 开 {n} 台 {flavors[0]} 的 {image} 机器，分别叫 {'、'.join(names)}",
+            f"create {n} VMs in {region}: " + ", ".join(names)
+                + f", all {flavors[0]} {image}",
+            f"帮我在 {region} 区开几台 {image} 虚机，名字 {'、'.join(names)}，规格都用 {flavors[0]}",
+        ]
+    else:
+        parts_zh = "、".join(f"{names[i]}({flavors[i]})" for i in range(n))
+        parts_en = ", ".join(f"{names[i]} {flavors[i]}" for i in range(n))
+        templates = [
+            f"在 {region} 帮我开几台 {image} 虚机：" + parts_zh,
+            f"create these {image} VMs in {region}: " + parts_en,
+        ]
+
+    tool_calls = [
+        {"type": "function", "function": {
+            "name": "create_vm",
+            "arguments": {"name": names[i], "region": region,
+                          "image": image, "flavor": flavors[i]},
+        }}
+        for i in range(n)
+    ]
+    return {
+        "tools": TOOLS,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": random.choice(templates)},
+            {"role": "assistant", "content": "", "tool_calls": tool_calls},
+        ],
+    }
+
+
+def sample_multi_action() -> dict:
+    """多个 vm 上做不同操作: 'stop A 然后 start B' 这种, 教模型并行规划。"""
+    # 先确保至少 3 台机器存在
+    while len(_VMS_view()) < 3:
+        dispatch("create_vm", {
+            "name": _rand_name(), "region": random.choice(REGIONS),
+            "image": random.choice(IMAGES), "flavor": random.choice(FLAVORS),
+        })
+    vm_ids = random.sample(list(_VMS_view().keys()), 2)
+    action_pairs = [
+        ("stop_vm", "stop_vm"),
+        ("stop_vm", "start_vm"),
+        ("get_vm", "get_vm"),
+        ("start_vm", "start_vm"),
+    ]
+    a1, a2 = random.choice(action_pairs)
+    zh = {"stop_vm": "停掉", "start_vm": "启动", "get_vm": "查一下"}
+    templates = [
+        f"{zh[a1]} {vm_ids[0]}，再{zh[a2]} {vm_ids[1]}",
+        f"{vm_ids[0]} 先{zh[a1]}，然后把 {vm_ids[1]} {zh[a2]}",
+        f"{a1} {vm_ids[0]} and {a2} {vm_ids[1]}",
+    ]
+    tool_calls = [
+        {"type": "function", "function": {"name": a1, "arguments": {"vm_id": vm_ids[0]}}},
+        {"type": "function", "function": {"name": a2, "arguments": {"vm_id": vm_ids[1]}}},
+    ]
+    return {
+        "tools": TOOLS,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": random.choice(templates)},
+            {"role": "assistant", "content": "", "tool_calls": tool_calls},
+        ],
+    }
+
+
+def _VMS_view():
+    """small helper so we don't have to import the private _VMS at module top."""
+    from tools.cloud_tools import _VMS  # noqa: PLC0415
+    return _VMS
+
+
 # ---- shared one-shot tool-call sample shape -------------------------------
 def _one_call_sample(user: str, tool_name: str, arguments: dict) -> dict:
     return {
@@ -232,14 +320,22 @@ GENERATORS = [
     sample_get_metrics,
 ]
 
+MULTI_CALL_GENERATORS = [
+    sample_multi_create_vm,
+    sample_multi_action,
+]
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--n", type=int, default=800)
+    ap.add_argument("--n", type=int, default=1200)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--neg_ratio", type=float, default=0.1, help="比例: 不调工具的样本")
-    ap.add_argument("--multi_ratio", type=float, default=0.15, help="比例: 多轮(调用+总结)样本")
+    ap.add_argument("--neg_ratio", type=float, default=0.08, help="比例: 不调工具的样本")
+    ap.add_argument("--multi_turn_ratio", type=float, default=0.12,
+                    help="比例: 多轮 (调用+总结) 样本")
+    ap.add_argument("--multi_call_ratio", type=float, default=0.20,
+                    help="比例: 一条消息内多次 tool_call 的样本 (并行规划)")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -247,14 +343,18 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_neg = int(args.n * args.neg_ratio)
-    n_multi = int(args.n * args.multi_ratio)
-    n_single = args.n - n_neg - n_multi
+    n_multi_turn = int(args.n * args.multi_turn_ratio)
+    n_multi_call = int(args.n * args.multi_call_ratio)
+    n_single = args.n - n_neg - n_multi_turn - n_multi_call
 
     samples: list[dict] = []
     for _ in range(n_single):
         reset_state()
         samples.append(random.choice(GENERATORS)())
-    for _ in range(n_multi):
+    for _ in range(n_multi_call):
+        reset_state()
+        samples.append(random.choice(MULTI_CALL_GENERATORS)())
+    for _ in range(n_multi_turn):
         reset_state()
         samples.append(sample_two_turn_list_then_summary())
     for _ in range(n_neg):
@@ -266,7 +366,8 @@ def main() -> None:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     print(f"wrote {len(samples)} samples → {out_path}")
-    print(f"  single-call: {n_single}  multi-turn: {n_multi}  negative: {n_neg}")
+    print(f"  single-call: {n_single}  multi-call: {n_multi_call}  "
+          f"multi-turn: {n_multi_turn}  negative: {n_neg}")
 
 
 if __name__ == "__main__":
