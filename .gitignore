@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# venv / conda
+.venv/
+venv/
+env/
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# Dataset (synthetic, regenerable)
+data/*.jsonl
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local env overrides
+.env
