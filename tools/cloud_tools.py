@@ -200,11 +200,17 @@ _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
 
 
 def dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Execute a tool by name. Returns a JSON-serializable dict."""
+    """Execute a tool by name. Returns a JSON-serializable dict.
+
+    小模型偶尔会把别的工具的参数当作 null 一起填进来 (schema bleeding);
+    与 OpenAI / Anthropic function-calling 行为一致, 这里先剔掉 None
+    再分发, 让 dispatch 对噪声更宽容。
+    """
     if name not in _HANDLERS:
         return {"error": f"unknown tool: {name}"}
+    cleaned = {k: v for k, v in (arguments or {}).items() if v is not None}
     try:
-        return _HANDLERS[name](**(arguments or {}))
+        return _HANDLERS[name](**cleaned)
     except TypeError as e:
         return {"error": f"bad arguments for {name}: {e}"}
     except Exception as e:
