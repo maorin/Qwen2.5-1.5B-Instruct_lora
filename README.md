@@ -13,7 +13,8 @@ POC: 用 LoRA 微调 Qwen2.5-1.5B-Instruct，使其能可靠地针对自然语�
 ├── data/gen_dataset.py         # 合成训练样本 (instruction → tool_call)
 ├── train/train_lora.py         # LoRA SFT (PEFT + TRL)，自动选 mps/cuda/cpu
 ├── infer/agent_loop.py         # 多轮 agent: 解析 tool_call → 执行 → 喂回
-└── mcp_server/server.py        # MCP stdio server，暴露同一套工具
+├── mcp_server/server.py        # MCP stdio server，暴露同一套工具
+└── docs/agent_loop.md          # agent_loop 测试流程详解 + v1/v2 实测对比
 ```
 
 `tools/cloud_tools.py` 是单一事实源 — 训练样本、推理 agent、MCP server
