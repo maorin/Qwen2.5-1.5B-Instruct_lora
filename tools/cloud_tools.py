@@ -1,210 +1,167 @@
-"""Single source of truth for the mock cloud platform.
+"""Single source of truth for the HCI create_vm tool.
 
-定义 OpenAI/Qwen 风格的 function-call JSON schema，并提供一个内存实现，
-训练数据生成、推理 agent、MCP server 全部从此处派生 — 三处定义不会漂移。
+设计原则 (production-style facade):
+- 给 LLM 暴露的是 **简化 schema** (8 个核心字段, 都是 LLM 能从用户原话推出来的);
+- dispatch 在 Python 侧用 DEFAULT_ENV 把 host_pid / pool_id / net_id / switch_id /
+  path 等 env-specific 字段补齐, 拼出真实 HCI 接口 POST /theapi/v5/vm/create
+  能接受的 30+ 字段 payload;
+- 不让 1.5B 模型直接生成 UUID 或重复 boilerplate。
+
+如果以后接多租户 / 多集群, 把 DEFAULT_ENV 改成从 config 读即可, 上层 schema
+和训练数据都不用动。
 """
 from __future__ import annotations
 
-import time
 import uuid
 from typing import Any, Callable
 
-REGIONS = ["cn-east-1", "cn-east-2", "cn-north-1", "us-west-1", "ap-southeast-1"]
-IMAGES = ["ubuntu-22.04", "ubuntu-20.04", "centos-7", "debian-12", "rocky-9"]
-FLAVORS = ["1c2g", "2c4g", "4c8g", "8c16g", "16c32g"]
-VM_STATUSES = ["pending", "running", "stopped", "error"]
+
+# ---- env-specific defaults (来自用户提供的 192.168.7.91 集群样例) ----------
+DEFAULT_ENV: dict[str, Any] = {
+    "host_ip": "192.168.7.91",
+    "host_pid": "b7e08766-f1f9-40f3-9887-a96d3ae3b1a8",
+    "pool": "default_pool",
+    "pool_id": "e31c06a3-0132-4145-a976-0402f99f7e07",
+    "path_prefix": "/hcidata/default_pool/volumes",
+    "network": "port1",
+    "net_id": "f96dff9f-20b1-4907-b9eb-6c828649f769",
+    "switch_id": "56a3b123-9b1e-4701-9143-71f050ac8c13",
+}
+
+# os_type 整数编码 (HCI 常见约定; 用户未明确, 如不符可改)
+OS_TYPE_LINUX = 1
+OS_TYPE_WINDOWS = 2
 
 
-# ---- schema (OpenAI function-calling style; Qwen tokenizer 直接吃) ----------
+# ---- LLM 看的简化 schema ---------------------------------------------------
 TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "create_vm",
-            "description": "创建一台虚拟机。返回新建实例的 id 与初始状态。",
+            "description": (
+                "在 HCI 平台上创建一台 KVM 虚拟机。对应真实接口 "
+                "POST /theapi/v5/vm/create。"
+                "环境相关字段 (host_pid / pool_id / net_id / switch_id / 路径等) "
+                "由平台 agent 自动补齐, 你不需要填。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "虚拟机名称，需在区域内唯一"},
-                    "region": {"type": "string", "enum": REGIONS},
-                    "image": {"type": "string", "enum": IMAGES},
-                    "flavor": {"type": "string", "enum": FLAVORS, "description": "规格，如 4c8g 表示 4 核 8GB"},
-                    "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1},
+                    "vm_name": {
+                        "type": "string",
+                        "description": "虚拟机名称, 须在集群内唯一",
+                    },
+                    "vcpu": {
+                        "type": "integer",
+                        "description": "vCPU 核数",
+                        "minimum": 1, "maximum": 128,
+                    },
+                    "memory_gb": {
+                        "type": "integer",
+                        "description": "内存大小, 单位 GB",
+                        "minimum": 1, "maximum": 1024,
+                    },
+                    "disk_gb": {
+                        "type": "integer",
+                        "description": "系统盘大小, 单位 GB",
+                        "minimum": 10, "maximum": 8192,
+                    },
+                    "os_type": {
+                        "type": "integer",
+                        "enum": [OS_TYPE_LINUX, OS_TYPE_WINDOWS],
+                        "description": "操作系统类型: 1=Linux 家族 (含 ubuntu/centos/debian/rocky/kylin/uos), 2=Windows",
+                    },
+                    "remark": {
+                        "type": "string",
+                        "description": "备注信息, 没有可不填",
+                    },
+                    "display_protocol": {
+                        "type": "string",
+                        "enum": ["spice", "vnc"],
+                        "description": "图形协议, 默认 spice",
+                    },
+                    "power_on": {
+                        "type": "boolean",
+                        "description": "创建后是否立即开机, 默认 false",
+                    },
                 },
-                "required": ["name", "region", "image", "flavor"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_vms",
-            "description": "列出虚拟机，支持按 region/status 过滤。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "region": {"type": "string", "enum": REGIONS},
-                    "status": {"type": "string", "enum": VM_STATUSES},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_vm",
-            "description": "查询单台虚拟机详细信息。",
-            "parameters": {
-                "type": "object",
-                "properties": {"vm_id": {"type": "string"}},
-                "required": ["vm_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stop_vm",
-            "description": "停止指定虚拟机。",
-            "parameters": {
-                "type": "object",
-                "properties": {"vm_id": {"type": "string"}},
-                "required": ["vm_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "start_vm",
-            "description": "启动已停止的虚拟机。",
-            "parameters": {
-                "type": "object",
-                "properties": {"vm_id": {"type": "string"}},
-                "required": ["vm_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_vm",
-            "description": "删除虚拟机，操作不可恢复。",
-            "parameters": {
-                "type": "object",
-                "properties": {"vm_id": {"type": "string"}},
-                "required": ["vm_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_metrics",
-            "description": "查询虚拟机最近一段时间的 CPU/内存指标。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "vm_id": {"type": "string"},
-                    "metric": {"type": "string", "enum": ["cpu", "memory", "disk_io"]},
-                    "window_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 15},
-                },
-                "required": ["vm_id", "metric"],
+                "required": ["vm_name", "vcpu", "memory_gb", "disk_gb", "os_type"],
             },
         },
     },
 ]
 
 
-# ---- in-memory backend ------------------------------------------------------
-_VMS: dict[str, dict[str, Any]] = {}
-
-
-def reset_state() -> None:
-    _VMS.clear()
-
-
-def snapshot_state() -> dict[str, Any]:
-    return {"vms": list(_VMS.values())}
-
-
-def _new_id() -> str:
-    return "vm-" + uuid.uuid4().hex[:8]
-
-
-def _create_vm(name: str, region: str, image: str, flavor: str, count: int = 1) -> dict[str, Any]:
-    created = []
-    for i in range(count):
-        vid = _new_id()
-        vm = {
-            "vm_id": vid,
-            "name": name if count == 1 else f"{name}-{i + 1}",
-            "region": region,
-            "image": image,
-            "flavor": flavor,
-            "status": "running",
-            "created_at": int(time.time()),
-        }
-        _VMS[vid] = vm
-        created.append(vm)
-    return {"created": created}
-
-
-def _list_vms(region: str | None = None, status: str | None = None) -> dict[str, Any]:
-    out = list(_VMS.values())
-    if region:
-        out = [v for v in out if v["region"] == region]
-    if status:
-        out = [v for v in out if v["status"] == status]
-    return {"vms": out, "count": len(out)}
-
-
-def _get_vm(vm_id: str) -> dict[str, Any]:
-    if vm_id not in _VMS:
-        return {"error": f"vm {vm_id} not found"}
-    return _VMS[vm_id]
-
-
-def _set_status(vm_id: str, status: str) -> dict[str, Any]:
-    if vm_id not in _VMS:
-        return {"error": f"vm {vm_id} not found"}
-    _VMS[vm_id]["status"] = status
-    return {"vm_id": vm_id, "status": status}
-
-
-def _delete_vm(vm_id: str) -> dict[str, Any]:
-    if vm_id not in _VMS:
-        return {"error": f"vm {vm_id} not found"}
-    _VMS.pop(vm_id)
-    return {"deleted": vm_id}
-
-
-def _get_metrics(vm_id: str, metric: str, window_minutes: int = 15) -> dict[str, Any]:
-    if vm_id not in _VMS:
-        return {"error": f"vm {vm_id} not found"}
-    import random
-    random.seed(hash((vm_id, metric, window_minutes)) & 0xFFFFFFFF)
-    points = [round(random.uniform(5, 95), 2) for _ in range(window_minutes)]
-    return {"vm_id": vm_id, "metric": metric, "unit": "%", "points": points}
+# ---- dispatch: 简化字段 → 真实 HCI payload ---------------------------------
+def _create_vm(
+    vm_name: str,
+    vcpu: int,
+    memory_gb: int,
+    disk_gb: int,
+    os_type: int,
+    remark: str = "",
+    display_protocol: str = "spice",
+    power_on: bool = False,
+) -> dict[str, Any]:
+    """Expand LLM-friendly args into the real HCI /vm/create body."""
+    disk_name = f"{vm_name}.qcow2"
+    body = {
+        "host_ip": DEFAULT_ENV["host_ip"],
+        "host_pid": DEFAULT_ENV["host_pid"],
+        "vm_name": vm_name,
+        "os_type": os_type,
+        "virtualization": "kvm",
+        "remark": remark,
+        "display_protocol": display_protocol,
+        "allowmc": "0",
+        "safe_status": 0,
+        "open": "1" if power_on else "0",
+        "vcpu_unit": str(vcpu),
+        "numa_cpu": [],
+        "memory_unit": str(memory_gb),
+        "memory_unit_type": "GB",
+        "mem_strategy": "",
+        "numa_mem": "",
+        "input_devices": {"mouse": "usb", "keyboard": "usb"},
+        "disk": [{
+            "pool": DEFAULT_ENV["pool"],
+            "disk_type": "file",
+            "size": str(disk_gb),
+            "disk_unit_type": "GB",
+            "path": f"{DEFAULT_ENV['path_prefix']}/{disk_name}",
+            "disk_name": disk_name,
+            "pool_id": DEFAULT_ENV["pool_id"],
+            "disk_id": str(uuid.uuid4()),
+        }],
+        "interface": [{
+            "interface_type": "network",
+            "mac": "",
+            "ip": "",
+            "network": DEFAULT_ENV["network"],
+            "net_id": DEFAULT_ENV["net_id"],
+            "model": "virtio",
+            "switch_id": DEFAULT_ENV["switch_id"],
+        }],
+        "cdrom": [{"disk_id": "", "pool_id": "", "storage_type_code": "", "path": ""}],
+    }
+    return {
+        "endpoint": "POST /theapi/v5/vm/create",
+        "host": DEFAULT_ENV["host_ip"],
+        "body": body,
+    }
 
 
 _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "create_vm": _create_vm,
-    "list_vms": _list_vms,
-    "get_vm": _get_vm,
-    "stop_vm": lambda vm_id: _set_status(vm_id, "stopped"),
-    "start_vm": lambda vm_id: _set_status(vm_id, "running"),
-    "delete_vm": _delete_vm,
-    "get_metrics": _get_metrics,
 }
 
 
 def dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Execute a tool by name. Returns a JSON-serializable dict.
 
-    小模型偶尔会把别的工具的参数当作 null 一起填进来 (schema bleeding);
-    与 OpenAI / Anthropic function-calling 行为一致, 这里先剔掉 None
-    再分发, 让 dispatch 对噪声更宽容。
+    与 OpenAI / Anthropic function-calling 一致, 剔掉 None 值再分发,
+    宽容地处理小模型偶尔的 schema bleeding。
     """
     if name not in _HANDLERS:
         return {"error": f"unknown tool: {name}"}
@@ -215,3 +172,12 @@ def dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"error": f"bad arguments for {name}: {e}"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+# legacy hooks (data/gen_dataset.py 老接口需要), 在 create-only 模式下退化为 no-op
+def reset_state() -> None:
+    pass
+
+
+def snapshot_state() -> dict[str, Any]:
+    return {}

@@ -82,13 +82,9 @@ async def probe() -> None:
     print("\n=== sample call: create_vm ===")
     result = await call_tool(
         "create_vm",
-        {"name": "probe-vm", "region": "cn-east-1",
-         "image": "ubuntu-22.04", "flavor": "2c4g"},
+        {"vm_name": "probe-vm", "vcpu": 4, "memory_gb": 8,
+         "disk_gb": 50, "os_type": 1, "remark": "probe"},
     )
-    print(result[0].text)
-
-    print("\n=== sample call: list_vms ===")
-    result = await call_tool("list_vms", {})
     print(result[0].text)
 
 
@@ -118,13 +114,9 @@ async def client_probe() -> None:
 
             print("\n=== call_tool create_vm via JSON-RPC ===")
             r = await session.call_tool("create_vm", {
-                "name": "client-probe", "region": "cn-east-2",
-                "image": "ubuntu-22.04", "flavor": "4c8g",
+                "vm_name": "client-probe", "vcpu": 4, "memory_gb": 8,
+                "disk_gb": 50, "os_type": 1,
             })
-            print(r.content[0].text)
-
-            print("\n=== call_tool list_vms via JSON-RPC ===")
-            r = await session.call_tool("list_vms", {})
             print(r.content[0].text)
 
             print("\n[ok] end-to-end MCP stdio protocol works.")
