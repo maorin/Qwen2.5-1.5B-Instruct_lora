@@ -87,6 +87,13 @@ async def probe() -> None:
     )
     print(result[0].text)
 
+    print("\n=== sample call: create_vm_from_template ===")
+    result = await call_tool(
+        "create_vm_from_template",
+        {"vm_name": "probe-template-vm", "template": "default", "remark": "probe"},
+    )
+    print(result[0].text)
+
 
 async def client_probe() -> None:
     """End-to-end probe: subprocess-spawn this same script as a stdio MCP
