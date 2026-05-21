@@ -14,6 +14,7 @@ POC: 用 LoRA 微调 Qwen2.5-1.5B-Instruct，使其能可靠地针对自然语�
 ├── train/train_lora.py         # LoRA SFT (PEFT + TRL)，自动选 mps/cuda/cpu
 ├── infer/agent_loop.py         # 多轮 agent: 解析 tool_call → 执行 → 喂回
 ├── mcp_server/server.py        # MCP stdio server，暴露同一套工具
+├── docs/hci_tools.md           # HCI 工具集成: 两个端点 + production facade + UUID 解析 + auth
 ├── docs/training.md            # 训练流程详解 (数据/tokenize/LoRA/TRL 1.x 适配)
 └── docs/agent_loop.md          # agent_loop 测试流程详解 + v1/v2 实测对比
 ```

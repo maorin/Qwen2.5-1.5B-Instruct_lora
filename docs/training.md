@@ -52,10 +52,13 @@ LoRA 微调 Qwen2.5-1.5B-Instruct 让它稳定生成云平台 function call 的�
 
 | 类别 | 默认占比 | 形态 | 学习目标 |
 |---|---|---|---|
-| **single-call** | 60% | 1 个用户请求 → 1 个 `tool_call` | 7 个工具各自的参数边界 |
-| **multi-call** | 20% | 1 个用户请求 → **多个** `tool_call`（一条 assistant 消息里）| 并行规划：要开两台不同名机器就发两次 `create_vm` |
-| **multi-turn** | 12% | 调用 → tool 返回 → assistant 总结 | 读懂 tool 结果，如实汇报 |
-| **negative** | 8% | 用户闲聊 / 问题与云无关 → 纯文本回复 | 不要 over-trigger tool call |
+| **create_vm 单调用** | 35% | 用户报 vCPU/内存/磁盘 → 1 个 `create_vm` | 选规格类工具 + 字段映射 |
+| **create_vm_from_template 单调用** | 30% | 用户提"模板"/"template" → 1 个 `create_vm_from_template` | 选模板类工具 + 名→UUID 解析 |
+| **create_vm 多调用** | 12% | 1 个请求 → **多个** `create_vm`（同一 assistant 消息里）| 并行规划：批量不同名定制规格 |
+| **create_vm_from_template 多调用** | 15% | 1 个请求 → 多个 `create_vm_from_template` | 并行规划：批量从模板克隆 |
+| **negative** | 8% | 用户闲聊 / 与云无关 → 纯文本回复 | 不要 over-trigger tool call |
+
+详细的"工具选择"训练目标见 [hci_tools.md §五](hci_tools.md)。
 
 样本格式（一行 jsonl）：
 
@@ -227,18 +230,31 @@ model = PeftModel.from_pretrained(base, "checkpoints/qwen-cloud-lora-v2")
 
 ---
 
-## 八、Case study：v1 → v2 的演进
+## 八、Case study：v1 → v4 的演进
 
-| 版本 | 数据量 | 改动 | 解决的问题 |
-|---|---|---|---|
-| **v1** | 800 | 只有 single-call + multi-turn + negative | baseline |
-| **v2** | 1200 | 加入 240 条 multi-call 样本 | 并行规划：开两台不同名机器要发两次调用 |
+| 版本 | 数据量 | 工具集 | 改动 | 解决的问题 |
+|---|---|---|---|---|
+| **v1** | 800 | 7 个 mock 工具 | single-call + multi-turn + negative | baseline |
+| **v2** | 1200 | 7 个 mock 工具 | 加入 240 条 multi-call 样本 | 并行规划：开两台不同名机器要发两次调用 |
+| **v3** | 1000 | **真实 HCI** `create_vm` | 替换 mock 为真实 HCI 接口 + production facade | 对接生产 |
+| **v4** | 1200 | + `create_vm_from_template` | 加入 360 条单 + 180 条多 from_template 样本 | **工具选择**：从用户原话二选一 |
 
-同一条 query 跑两版的对比详见 [agent_loop.md §六](agent_loop.md)。结论：
+v1 → v2 同条 query 的对比详见 [agent_loop.md §六](agent_loop.md)。
 
-> POC 量级里，schema bleeding 和并行规划这类"小模型典型短板"，**不需要换大模型 ——
-> 240 条针对性样本就能在 LoRA 上推平**。前提是数据里要明确呈现"做对的样子"，
-> 比单纯堆样本量更高效。
+v3 → v4 的核心新增：**让模型学会从用户话术二选工具**：
+
+| 信号词 | 应选工具 |
+|---|---|
+| "X 核 Y G 内存"、"系统盘 Z G" | `create_vm` |
+| "模板"、"template"、"基于 X 克隆"、"按 X 模板建" | `create_vm_from_template` |
+
+工具选择背后的 facade 架构、UUID 解析、HTTP/auth 全部见 [hci_tools.md](hci_tools.md)。
+
+结论（不变）：
+
+> POC 量级里，schema bleeding、并行规划、工具选择这类"小模型典型短板"，
+> **不需要换大模型 —— 几百条针对性样本就能在 LoRA 上推平**。前提是数据里要
+> 明确呈现"做对的样子"，比单纯堆样本量更高效。
 
 ---
 
